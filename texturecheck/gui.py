@@ -124,6 +124,13 @@ class App(tk.Tk):
         self.stats = ttk.Label(self, padding=(10, 0), justify="left", font=("TkDefaultFont", 11, "bold"))
         self.stats.pack(fill="x")
 
+        # Custom-screen 4:3 warning, right below the totals. Red and bold when a custom
+        # CRT screen mesh isn't 4:3; blank otherwise. Filled in once the 3D model loads.
+        self.screen_label = ttk.Label(
+            self, padding=(10, 0), justify="left",
+            font=("TkDefaultFont", 11, "bold"), foreground="#c00000")
+        self.screen_label.pack(fill="x")
+
         # Top half: the 3D cabinet on the left (~1/3), then the selected texture with
         # its resize-target dropdowns. Bottom half: the texture list. Sashes drag.
         split = ttk.PanedWindow(self, orient="vertical")
@@ -778,6 +785,7 @@ class App(tk.Tk):
         self._model_photo = None
         self._rendered_size = None
         self.model_view.config(image="", text="Building 3D preview...", foreground="#999999")
+        self.screen_label.config(text="")  # clear any previous cabinet's screen warning
         self._load_gen += 1
         gen = self._load_gen
 
@@ -797,9 +805,11 @@ class App(tk.Tk):
         if err is not None or model is None or model.empty:
             self.model_view.config(image="", text="No 3D model found in this cabinet.")
             self._update_uv_column(None)
+            self._update_screen_status(None)
             return
         # UV coverage comes from the CPU model build, so fill it in even if GL fails below.
         self._update_uv_column(model)
+        self._update_screen_status(model)
         renderer = self._ensure_renderer()
         if renderer is None:
             self.model_view.config(image="", text="3D preview unavailable\n(no OpenGL on this machine).")
@@ -842,6 +852,16 @@ class App(tk.Tk):
             values[6] = self._issues_text(report)               # the "Issues" column
             self.tree.item(item, values=values)
         self._autosize_columns()  # UV usage / Issues text changed, re-fit
+
+    def _update_screen_status(self, model):
+        # Show the red 4:3 warning only when the cabinet ships a custom CRT screen mesh
+        # whose measured aspect isn't 4:3. Non-custom cabinets, a compliant custom screen,
+        # or a mesh we couldn't find leave the line blank.
+        screen = model.screen if model is not None else None
+        if screen is not None and screen.found and not screen.ok:
+            self.screen_label.config(text="Warning: Custom Screentype may not be 4:3 aspect ratio!")
+        else:
+            self.screen_label.config(text="")
 
     def _add_no_uv_issue(self, report):
         msg = "Target mesh has no UVs, so will be flat color."

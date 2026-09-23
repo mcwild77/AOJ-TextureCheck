@@ -12,6 +12,12 @@ from texturecheck import cabinet, resize, rules, sources
 REPO = Path(__file__).resolve().parent.parent
 SAMPLES = REPO / "Cabinets"
 
+try:
+    import trimesh  # noqa: F401  (only needed by the 3D-preview / screen-geometry tests)
+    HAS_TRIMESH = True
+except Exception:
+    HAS_TRIMESH = False
+
 
 def png_bytes(size, color=(200, 30, 30)):
     img = Image.new("RGB", size, color)
@@ -54,6 +60,14 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(rules.suggested_size(773, 262), (512, 256))
         self.assertEqual(rules.suggested_size(3000, 1026), (2048, 1024))
         self.assertEqual(rules.suggested_size(512, 512), (512, 512))
+
+    def test_screen_aspect_ok(self):
+        # 4:3 (and, since it is a longer/shorter ratio, 3:4 portrait too) passes.
+        self.assertTrue(rules.screen_aspect_ok(4 / 3))
+        self.assertTrue(rules.screen_aspect_ok(1.355))  # a real 4:3 with modeling slop
+        # The common mistakes people ship are all rejected.
+        for ratio in (1.0, 5 / 4, 3 / 2, 16 / 10, 16 / 9):
+            self.assertFalse(rules.screen_aspect_ok(ratio))
 
 
 class CabinetTest(unittest.TestCase):
@@ -259,6 +273,105 @@ class SampleCabinetsTest(unittest.TestCase):
         self.assertTrue(r["main.png"].flat_color)
         self.assertEqual(r["main.png"].target_size, (8, 8))
         self.assertNotIn("vcop2.mp4.png", r)
+
+
+class CrtMeshParseTest(unittest.TestCase):
+    """crt_custom_mesh reads description.yaml as text -- no trimesh needed."""
+
+    def _mesh(self, crt_yaml):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cab.zip"
+            make_zip(path, {"description.yaml": ("name: x\n" + crt_yaml).encode()})
+            with sources.open_source(str(path)) as src:
+                return cabinet.crt_custom_mesh(src)
+
+    def test_custom_returns_mesh_name(self):
+        self.assertEqual(
+            self._mesh("crt:\n  type: custom\n  mesh: my-screen\n  screen:\n    shader: crt\n"),
+            "my-screen")
+
+    def test_builtin_type_returns_none(self):
+        # A built-in screen type uses the engine's own screen; nothing to check.
+        self.assertIsNone(self._mesh("crt:\n  type: 19i\n  orientation: horizontal\n"))
+
+    def test_no_crt_block_returns_none(self):
+        self.assertIsNone(self._mesh("parts:\n  - name: main\n"))
+
+    def test_crt_block_last_in_file(self):
+        # The block regex must still terminate when crt: is the final section.
+        self.assertEqual(self._mesh("crt:\n  type: custom\n  mesh: scr"), "scr")
+
+
+@unittest.skipUnless(HAS_TRIMESH, "trimesh not installed (3D-preview dependency)")
+class ScreenGeometryTest(unittest.TestCase):
+    """The 4:3 geometry check over a synthetic GLB screen mesh."""
+
+    def _cabinet(self, quads, screen_type="custom", mesh_name="my-screen"):
+        """A cabinet zip whose `mesh_name` node holds `quads` flat rectangles.
+
+        Each quad is (width, height); several quads model a TWIN's two screens.
+        """
+        import numpy as np
+
+        verts, faces = [], []
+        x = 0.0
+        for w, h in quads:
+            base = len(verts)
+            verts += [[x, 0, 0], [x + w, 0, 0], [x + w, h, 0], [x, h, 0]]
+            faces += [[base, base + 1, base + 2], [base, base + 2, base + 3]]
+            x += w + 1.0  # a gap, so the quads are separate connected components
+        screen = trimesh.Trimesh(vertices=np.array(verts, float), faces=np.array(faces), process=False)
+        scene = trimesh.Scene()
+        scene.add_geometry(screen, node_name=mesh_name, geom_name=mesh_name)
+        scene.add_geometry(trimesh.creation.box(extents=[2, 2, 2]), node_name="main", geom_name="main")
+        yaml = (f"name: test\nparts:\n  - name: main\n    art:\n      file: main.png\n"
+                f"crt:\n  type: {screen_type}\n  mesh: {mesh_name}\n  screen:\n    shader: crt\n")
+        d = tempfile.mkdtemp()
+        path = Path(d) / "cab.zip"
+        make_zip(path, {"description.yaml": yaml.encode(), "cab.glb": scene.export(file_type="glb")})
+        return str(path)
+
+    def screen(self, *args, **kwargs):
+        from texturecheck import preview3d
+        return preview3d.build_model(self._cabinet(*args, **kwargs)).screen
+
+    def test_four_three_passes(self):
+        s = self.screen([(4, 3)])
+        self.assertTrue(s.found and s.ok)
+
+    def test_sixteen_nine_flagged(self):
+        s = self.screen([(16, 9)])
+        self.assertTrue(s.found)
+        self.assertFalse(s.ok)
+
+    def test_square_flagged(self):
+        self.assertFalse(self.screen([(1, 1)]).ok)
+
+    def test_portrait_four_three_passes(self):
+        # A vertical 3:4 screen has the same longer/shorter ratio as 4:3, so it passes.
+        self.assertTrue(self.screen([(3, 4)]).ok)
+
+    def test_twin_two_quads_measured_separately(self):
+        # Two 4:3 quads in one node must each read 4:3, not ~2.7:1 for the pair.
+        s = self.screen([(4, 3), (4, 3)])
+        self.assertEqual(len(s.aspects), 2)
+        self.assertTrue(s.ok)
+
+    def test_builtin_type_not_checked(self):
+        self.assertIsNone(self.screen([(16, 9)], screen_type="19i"))
+
+    def test_missing_mesh_reported_not_flagged(self):
+        # A custom screen naming a mesh the GLB lacks reports found=False -- never a
+        # 4:3 alarm (so the GUI stays quiet rather than crying wolf over a typo).
+        from texturecheck import preview3d
+        path = self._cabinet([(16, 9)], mesh_name="present")
+        with zipfile.ZipFile(path) as z:
+            data = {n: z.read(n) for n in z.namelist()}
+        data["description.yaml"] = data["description.yaml"].replace(b"mesh: present", b"mesh: nope")
+        make_zip(path, data)
+        screen = preview3d.build_model(path).screen
+        self.assertFalse(screen.found)
+        self.assertTrue(screen.ok)  # not found is not a failure
 
 
 if __name__ == "__main__":

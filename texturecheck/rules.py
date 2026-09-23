@@ -34,6 +34,20 @@ LOW_COLOR_BLUR = 1.0    # Gaussian radius for the perceptual comparison
 # lands ~128 rather than an over-cautious 256. Advisory only.
 LOW_COLOR_DETAIL_MSE = 20.0
 
+# Custom CRT screens (crt: type: custom) supply their own screen mesh. Most arcade
+# games are 4:3, so a screen quad whose measured aspect (longer side / shorter side)
+# strays past this tolerance from 4:3 is almost always a mistake (people ship 1:1 or
+# 16:9). The tolerance accepts ~1.27..1.39, so a real 4:3 with modeling slop passes
+# while 5:4 (1.25), 3:2 (1.5), 16:10 (1.6) and 16:9 (1.78) are all flagged.
+SCREEN_TARGET_ASPECT = 4 / 3
+SCREEN_ASPECT_TOLERANCE = 0.06
+
+
+def screen_aspect_ok(ratio: float) -> bool:
+    """True if a screen's longer/shorter aspect is close enough to 4:3."""
+    return abs(ratio - SCREEN_TARGET_ASPECT) <= SCREEN_ASPECT_TOLERANCE
+
+
 ERROR = "error"
 WARNING = "warning"
 INFO = "info"

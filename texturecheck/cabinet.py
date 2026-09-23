@@ -118,6 +118,29 @@ def _part_chunks(src: "sources.ZipCabinet | sources.FolderCabinet") -> list[tupl
     return out
 
 
+def crt_custom_mesh(src: "sources.ZipCabinet | sources.FolderCabinet") -> str | None:
+    """The screen-mesh node name for a `crt: type: custom` cabinet, else None.
+
+    Age of Joy lets a cabinet ship its own CRT screen via
+    `crt: { type: custom, mesh: <node> }`. Built-in screen types (e.g. `19i`)
+    use the engine's own screen, so there is nothing of the author's to check --
+    only `type: custom` returns a name. Read as text, like the other yaml helpers
+    here, so no YAML dependency is needed and a malformed file still degrades.
+    """
+    yaml_name = next((n for n in src.namelist() if n.rsplit("/", 1)[-1].lower() == "description.yaml"), None)
+    if yaml_name is None:
+        return None
+    text = src.read(yaml_name).decode("utf-8", errors="replace")
+    block_match = re.search(r"^crt:\s*$(.*?)(?=^\S|\Z)", text, flags=re.MULTILINE | re.DOTALL)
+    if not block_match:
+        return None
+    block = block_match.group(1)
+    if not re.search(r"^\s*type:\s*['\"]?custom\b", block, flags=re.MULTILINE | re.IGNORECASE):
+        return None
+    mesh_match = re.search(r"^\s*mesh:\s*['\"]?(.+?)['\"]?\s*$", block, flags=re.MULTILINE)
+    return mesh_match.group(1).strip() if mesh_match else None
+
+
 def part_art_map(src: "sources.ZipCabinet | sources.FolderCabinet") -> dict[str, str]:
     """Map each part name (as it appears in the GLB) to its `art.file` texture.
 

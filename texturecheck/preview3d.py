@@ -25,7 +25,21 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image
 
-from . import cabinet, sources
+from . import cabinet, rules, sources
+
+
+@dataclass
+class ScreenCheck:
+    """Result of the 4:3 aspect check on a `crt: type: custom` screen mesh.
+
+    `aspects` is the longer/shorter side ratio of each screen quad (a TWIN cabinet
+    packs two quads under one node, hence a list). `ok` is False when any quad
+    strays from 4:3; `found` is False when the named mesh isn't in any GLB.
+    """
+    mesh_name: str
+    found: bool
+    ok: bool
+    aspects: list = field(default_factory=list)
 
 
 @dataclass
@@ -52,6 +66,8 @@ class CabinetModel:
     focus_targets: dict = field(default_factory=dict)
     # texture filename (lowercased basename) -> percent of the texture map its UVs cover.
     uv_coverage: dict = field(default_factory=dict)
+    # 4:3 check on a custom CRT screen mesh, or None when the cabinet has no custom screen.
+    screen: "ScreenCheck | None" = None
 
     @property
     def empty(self) -> bool:
@@ -111,6 +127,91 @@ def _pick_cabinet_glb(zf, part_names: set[str]):
     return (best[1], best[2]) if best else (None, None)
 
 
+def _planar_aspect(verts: np.ndarray) -> float | None:
+    """Longer/shorter in-plane side of a roughly planar vertex set, via PCA.
+
+    A screen quad is flat, so PCA's two largest principal axes span its face and the
+    smallest is its thickness/curvature (dropped). The ratio of the face extents is the
+    aspect, independent of how the screen is oriented in the cabinet. None if degenerate.
+    """
+    if len(verts) < 3:
+        return None
+    centered = verts - verts.mean(0)
+    try:
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    except Exception:
+        return None
+    proj = centered @ vt.T
+    ext = np.sort(proj.max(0) - proj.min(0))[::-1]  # [major, minor, thickness]
+    if ext[1] <= 1e-9:
+        return None
+    return float(ext[0] / ext[1])
+
+
+def _screen_aspects(scene, mesh_name: str) -> list[float]:
+    """Aspect ratio of each screen quad in `scene`'s node named `mesh_name`.
+
+    The named node is split into connected components first, because a TWIN cabinet
+    holds two separate screen quads under one node -- measuring them together would
+    read ~2.7:1 and false-alarm. Each component is measured on its own.
+    """
+    import trimesh
+
+    node = {n.lower(): n for n in scene.graph.nodes}.get(mesh_name.lower())
+    if node is None:
+        return []
+    try:
+        transform, geom_name = scene.graph[node]
+    except Exception:
+        return []
+    geom = scene.geometry.get(geom_name)
+    if geom is None or len(getattr(geom, "faces", [])) == 0:
+        return []
+    world = trimesh.transformations.transform_points(
+        np.asarray(geom.vertices, np.float64), transform)
+    mesh = trimesh.Trimesh(vertices=world, faces=np.asarray(geom.faces), process=False)
+    try:
+        components = mesh.split(only_watertight=False)
+    except Exception:
+        components = []
+    if len(components) <= 1:
+        components = [mesh]
+    aspects = []
+    for comp in components:
+        aspect = _planar_aspect(np.asarray(comp.vertices, np.float64))
+        if aspect is not None:
+            aspects.append(aspect)
+    return aspects
+
+
+def _check_screen(zf, scene, mesh_name: str | None) -> "ScreenCheck | None":
+    """Aspect-check a custom CRT screen mesh, or None when the cabinet has no custom one.
+
+    Tries the already-loaded cabinet `scene` first; if the mesh lives in a different
+    GLB, scans the rest of the zip for it. A missing mesh is reported (found=False),
+    never treated as a 4:3 failure.
+    """
+    import trimesh
+
+    if not mesh_name:
+        return None
+    aspects = _screen_aspects(scene, mesh_name)
+    if not aspects:
+        for name in (n for n in zf.namelist() if n.lower().endswith(".glb")):
+            try:
+                other = trimesh.load(io.BytesIO(zf.read(name)), file_type="glb", process=False)
+            except Exception:
+                continue
+            if isinstance(other, trimesh.Scene):
+                aspects = _screen_aspects(other, mesh_name)
+                if aspects:
+                    break
+    if not aspects:
+        return ScreenCheck(mesh_name, found=False, ok=True, aspects=[])
+    ok = all(rules.screen_aspect_ok(a) for a in aspects)
+    return ScreenCheck(mesh_name, found=True, ok=ok, aspects=aspects)
+
+
 def build_model(zip_path: str) -> CabinetModel:
     """Load the cabinet GLB and resolve description.yaml texture overrides (CPU only).
 
@@ -125,6 +226,8 @@ def build_model(zip_path: str) -> CabinetModel:
         scene, glb_bytes = _pick_cabinet_glb(zf, set(art))
         if scene is None:
             return model
+        # 4:3 check on the author's own screen mesh, when the cabinet ships a custom one.
+        model.screen = _check_screen(zf, scene, cabinet.crt_custom_mesh(zf))
         zip_names = {n.rsplit("/", 1)[-1].lower(): n for n in zf.namelist()}
         # trimesh only exposes UVs for primitives that carry an embedded texture, so
         # read TEXCOORD_0 straight from the GLB for every named node (see _glb_node_uvs).
