@@ -15,6 +15,3 @@ dist/
 
 # Scratch extractions of sample cabinets
 Cabinets/*_Working*/
-
-# Local project notes / tooling (kept out of the repo)
-CLAUDE.md
