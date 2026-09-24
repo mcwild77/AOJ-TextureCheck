@@ -57,6 +57,9 @@ If your cabinet uses a custom screen (`crt: type: custom`), the app also measure
 - **The app's suggestions only ever shrink textures.** A texture that isn't a power of two is rounded down (773 wide becomes 512), never up.
 - **Not checked:** textures stored inside `.glb` model files.
 
+### AI Disclaimer
+Claude says bonjour.
+
 ## For developers
 
 You need Python 3.10 or newer.

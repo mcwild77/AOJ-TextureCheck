@@ -15,3 +15,6 @@ dist/
 
 # Scratch extractions of sample cabinets
 Cabinets/*_Working*/
+
+# Claude Code project notes (local only)
+CLAUDE.md
