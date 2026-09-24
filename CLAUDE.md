@@ -16,7 +16,7 @@ build_windows.bat                                                     # Windows 
 
 On macOS use `python3` and `python3 -m pip`, since `python` and `pip` are often not on PATH. If pip reports an externally-managed environment, use a venv (`python3 -m venv .venv`).
 
-The Windows `.exe` has only been specified, not built: `build_windows.bat` has never been run, because development so far has been on macOS. PyInstaller does not cross-compile.
+`build_windows.bat` builds inside a private venv (`buildenv`) so only `requirements.txt` is bundled. Building from the main Python instead drags in whatever trimesh can optionally import (OpenCV, scipy, pandas...) and gave a 153 MB exe versus ~29 MB. Because the build venv has no scipy/networkx, don't rely on trimesh features that need them (e.g. `mesh.split()`); `preview3d._connected_vertex_sets` exists for exactly that reason. PyInstaller does not cross-compile, so the exe must be built on Windows. The script keeps CRLF line endings via `.gitattributes`.
 
 ## Purpose
 
@@ -25,7 +25,7 @@ A texture checker for user-generated arcade cabinets in **Age of Joy**, a VR arc
 ## Constraints that drive design decisions
 
 - **Users are cabinet builders who are not very technical.** The tool must be easy to use, and error messages must say what is wrong and how to fix it, not just report a failure.
-- **Runs on Windows with as few dependencies as possible.** Ideally a single double-clickable executable with no runtime or installer required. Development is happening on macOS, so the stack needs to be developable and testable here even though the target is Windows. The 3D preview (trimesh + moderngl) is a deliberate exception the user signed off on; it must degrade gracefully so the checker still works where 3D does not, and its Windows/PyInstaller packaging is still unproven.
+- **Runs on Windows with as few dependencies as possible.** Ideally a single double-clickable executable with no runtime or installer required. Development is happening on macOS, so the stack needs to be developable and testable here even though the target is Windows. The 3D preview (trimesh + moderngl) is a deliberate exception the user signed off on; it must degrade gracefully so the checker still works where 3D does not, and its Windows/PyInstaller packaging has been verified (frozen exe checks, loads and renders all sample cabinets).
 - **A GUI is required.**
 - **Resizing is likely required**, not just reporting. Because resizing modifies user art, never overwrite originals silently. (The resize UI is currently shelved in the GUI — see Architecture.)
 

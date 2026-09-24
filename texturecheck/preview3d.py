@@ -169,19 +169,34 @@ def _screen_aspects(scene, mesh_name: str) -> list[float]:
         return []
     world = trimesh.transformations.transform_points(
         np.asarray(geom.vertices, np.float64), transform)
-    mesh = trimesh.Trimesh(vertices=world, faces=np.asarray(geom.faces), process=False)
-    try:
-        components = mesh.split(only_watertight=False)
-    except Exception:
-        components = []
-    if len(components) <= 1:
-        components = [mesh]
     aspects = []
-    for comp in components:
-        aspect = _planar_aspect(np.asarray(comp.vertices, np.float64))
+    for comp in _connected_vertex_sets(len(world), np.asarray(geom.faces)):
+        aspect = _planar_aspect(world[comp])
         if aspect is not None:
             aspects.append(aspect)
     return aspects
+
+
+def _connected_vertex_sets(n_verts: int, faces: np.ndarray) -> list[np.ndarray]:
+    """Vertex indices of each face-connected piece of a mesh.
+
+    Done in numpy rather than trimesh's `mesh.split()`, which needs scipy or networkx:
+    neither is a dependency, so in the packaged exe split() silently fails and a TWIN's
+    two screens get measured as one wide quad. Labels spread across each face (every
+    vertex takes its face's smallest label) with pointer jumping until nothing changes.
+    """
+    faces = faces.reshape(len(faces), -1)
+    labels = np.arange(n_verts)
+    while True:
+        face_min = labels[faces].min(1)
+        new = labels.copy()
+        np.minimum.at(new, faces, face_min[:, None])
+        new = new[new]  # pointer jumping: follow a label to its own label
+        if np.array_equal(new, labels):
+            break
+        labels = new
+    used = np.unique(faces)
+    return [used[labels[used] == root] for root in np.unique(labels[used])]
 
 
 def _check_screen(zf, scene, mesh_name: str | None) -> "ScreenCheck | None":
