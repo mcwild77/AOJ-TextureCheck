@@ -2,6 +2,8 @@
 
 A quick and dirty Windows tool for optimizing cabinets for the cool VR arcade simulator **Age of Joy**. Just open a cabinet and it lists every texture that might break the texturing size rules, shows you what to change, and saves a copy of the cabinet with the textures resized. Your original cabinet is never changed. Wow!
 
+![The Texture Checker with a cabinet open: 3D preview on the left, a texture and its resized version on the right, and the texture table below](docs/screenshot.PNG)
+
 ## Download
 
 1. Go to the [Releases page](https://github.com/mcwild77/AOJ-TextureCheck/releases/latest) and download `TextureChecker.zip`.
