@@ -45,4 +45,15 @@ Not from the source page. This is what `texturecheck/rules.py` and `texturecheck
 - **Warning**: a power-of-two texture larger than 4096 on either side.
 - **Info**: the texture looks like a flat color (4 or fewer distinct colors) but is larger than 8x8, or it is not referenced by `description.yaml`.
 
+### Polygon budget
+
+Also not from the source page. The thresholds came from the project owner. The total counts the triangles in every visible mesh of the cabinet model, whether or not it has a texture assigned (a part hidden with `visible: false` doesn't count). It also counts every other `.glb` in the zip in full, such as a lightgun's `gun: model:`. The cabinet is flagged by the highest tier its total is over:
+
+| Total over | Severity | Meaning |
+|---|---|---|
+| 25,000 | Warning | High polygon count |
+| 100,000 | Error | Very high polygon count |
+| 200,000 | Error | Extremely high: a huge performance hit |
+| 300,000 | Error | Dangerously high: risks crashing the game |
+
 Not implemented yet: flagging `.astc` files, and judging a texture's size against the component's likely role.

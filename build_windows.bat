@@ -5,6 +5,15 @@ rem not whatever else is installed in the main Python (scipy, OpenCV, pandas...)
 setlocal
 cd /d "%~dp0"
 
+rem A running TextureChecker.exe locks dist\TextureChecker.exe, and PyInstaller
+rem only fails on that after the whole build ("Access is denied"), so check first.
+tasklist /FI "IMAGENAME eq TextureChecker.exe" 2>nul | findstr /I "TextureChecker.exe" >nul
+if not errorlevel 1 (
+    echo TextureChecker is still running, so its exe cannot be replaced.
+    echo Close every TextureChecker window, then run this script again.
+    goto :fail
+)
+
 if not exist build\venv\Scripts\python.exe (
     echo Creating build environment in build\venv ...
     python -m venv build\venv || goto :fail

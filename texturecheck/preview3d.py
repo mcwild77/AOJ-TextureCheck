@@ -66,6 +66,13 @@ class CabinetModel:
     focus_targets: dict = field(default_factory=dict)
     # texture filename (lowercased basename) -> percent of the texture map its UVs cover.
     uv_coverage: dict = field(default_factory=dict)
+    # texture filename (lowercased basename) -> triangle count of the visible mesh(es)
+    # it is applied to (summed when several parts share one texture).
+    poly_counts: dict = field(default_factory=dict)
+    # Triangles across every visible mesh of the cabinet model, textured or not, plus
+    # every other model in the zip (other_model_polys: file name -> its triangles).
+    total_polys: int = 0
+    other_model_polys: dict = field(default_factory=dict)
     # 4:3 check on a custom CRT screen mesh, or None when the cabinet has no custom screen.
     screen: "ScreenCheck | None" = None
 
@@ -123,8 +130,8 @@ def _pick_cabinet_glb(zf, part_names: set[str]):
         nodes = {n.lower() for n in scene.graph.nodes}
         key = (len(nodes & part_names), len(data))
         if best is None or key > best[0]:
-            best = (key, scene, data)
-    return (best[1], best[2]) if best else (None, None)
+            best = (key, scene, data, name)
+    return best[1:] if best else (None, None, None)
 
 
 def _planar_aspect(verts: np.ndarray) -> float | None:
@@ -238,7 +245,7 @@ def build_model(zip_path: str) -> CabinetModel:
     with sources.open_source(zip_path) as zf:
         art = cabinet.part_art_map(zf)  # part name -> texture filename
         styles = cabinet.part_style_map(zf)  # part name -> {'color', 'visible'}
-        scene, glb_bytes = _pick_cabinet_glb(zf, set(art))
+        scene, glb_bytes, glb_name = _pick_cabinet_glb(zf, set(art))
         if scene is None:
             return model
         # 4:3 check on the author's own screen mesh, when the cabinet ships a custom one.
@@ -247,6 +254,15 @@ def build_model(zip_path: str) -> CabinetModel:
         # trimesh only exposes UVs for primitives that carry an embedded texture, so
         # read TEXCOORD_0 straight from the GLB for every named node (see _glb_node_uvs).
         raw_uvs = _glb_node_uvs(glb_bytes)
+        node_tris = _glb_node_triangles(glb_bytes)
+        # Other models in the zip (e.g. a lightgun's `gun: model:`) are drawn in game
+        # too, so they count toward the cabinet's total. Counted whole, since the yaml's
+        # `visible:` flags only describe the cabinet body.
+        for name in zf.namelist():
+            if name.lower().endswith(".glb") and name != glb_name:
+                tris = sum(t for _, t in _glb_node_triangles(zf.read(name)))
+                if tris:
+                    model.other_model_polys[name.rsplit("/", 1)[-1]] = tris
 
         lo = np.full(3, np.inf)
         hi = np.full(3, -np.inf)
@@ -361,6 +377,17 @@ def build_model(zip_path: str) -> CabinetModel:
         key = override.rsplit("/", 1)[-1].lower()
         cov_tris.setdefault(key, []).extend(prims)
     model.uv_coverage = {name: _uv_coverage(tris) for name, tris in cov_tris.items()}
+    # Triangles for the whole cabinet and per texture, from the same GLB node names.
+    # Hidden parts don't draw in game, so they don't count.
+    model.total_polys = sum(model.other_model_polys.values())
+    for node_lower, tris in node_tris:
+        if styles.get(node_lower, {}).get("visible") is False:
+            continue
+        model.total_polys += tris
+        override = art.get(node_lower)
+        if override is not None:
+            key = override.rsplit("/", 1)[-1].lower()
+            model.poly_counts[key] = model.poly_counts.get(key, 0) + tris
     return model
 
 
@@ -478,6 +505,42 @@ def _glb_node_uvs(data: bytes) -> dict:
                 continue
             faces = idx[: len(idx) - len(idx) % 3].reshape(-1, 3)
             out.setdefault(name.lower(), []).append((uv, faces))
+    return out
+
+
+def _glb_node_triangles(data: bytes) -> list:
+    """[(node name lowercased, or "" if unnamed; triangle count), ...] per mesh node.
+
+    Read from the GLB's glTF JSON per node rather than per trimesh geometry, because
+    trimesh splits a multi-primitive mesh into `<name>_<hash>` child nodes that no longer
+    match the yaml part name. Only accessor counts are read, no buffers. Any parse
+    trouble degrades to [].
+    """
+    try:
+        parsed = _parse_glb(data)
+    except Exception:
+        return []
+    if parsed is None:
+        return []
+    gltf = parsed[0]
+    meshes, accessors = gltf.get("meshes", []), gltf.get("accessors", [])
+    out: list[tuple[str, int]] = []
+    for node in gltf.get("nodes", []):
+        name, mesh_idx = node.get("name") or "", node.get("mesh")
+        if mesh_idx is None or mesh_idx >= len(meshes):
+            continue
+        tris = 0
+        for prim in meshes[mesh_idx].get("primitives", []):
+            acc = prim.get("indices", prim.get("attributes", {}).get("POSITION"))
+            if acc is None or acc >= len(accessors):
+                continue
+            n = accessors[acc].get("count", 0)
+            mode = prim.get("mode", 4)
+            if mode == 4:  # triangles
+                tris += n // 3
+            elif mode in (5, 6):  # triangle strip / fan
+                tris += max(n - 2, 0)
+        out.append((name.lower(), tris))
     return out
 
 

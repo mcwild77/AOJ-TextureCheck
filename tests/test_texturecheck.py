@@ -374,5 +374,93 @@ class ScreenGeometryTest(unittest.TestCase):
         self.assertTrue(screen.ok)  # not found is not a failure
 
 
+@unittest.skipUnless(HAS_TRIMESH, "trimesh not installed (3D-preview dependency)")
+class PolyCountTest(unittest.TestCase):
+    """Triangle counts per texture, from the meshes description.yaml applies it to."""
+
+    def test_counts_summed_per_texture_and_hidden_parts_skipped(self):
+        from texturecheck import preview3d
+
+        scene = trimesh.Scene()
+        box = trimesh.creation.box(extents=[1, 1, 1])  # 12 triangles
+        for name in ("left", "right", "hidden"):
+            scene.add_geometry(box.copy(), node_name=name, geom_name=name)
+        quad = trimesh.Trimesh(vertices=[[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+                               faces=[[0, 1, 2], [0, 2, 3]], process=False)
+        scene.add_geometry(quad, node_name="marquee", geom_name="marquee")
+        yaml = ("name: test\nparts:\n"
+                "  - name: left\n    art:\n      file: side.png\n"
+                "  - name: right\n    art:\n      file: side.png\n"
+                "  - name: hidden\n    visible: false\n    art:\n      file: side.png\n"
+                "  - name: marquee\n    art:\n      file: marquee.png\n")
+        path = Path(tempfile.mkdtemp()) / "cab.zip"
+        make_zip(path, {"description.yaml": yaml.encode(), "cab.glb": scene.export(file_type="glb"),
+                        "side.png": png_bytes((64, 64)), "marquee.png": png_bytes((64, 64))})
+        polys = preview3d.build_model(str(path)).poly_counts
+        self.assertEqual(polys, {"side.png": 24, "marquee.png": 2})
+
+    def test_multi_primitive_node_counted_whole(self):
+        # trimesh splits a multi-primitive mesh into renamed child nodes, so the count
+        # is read per glTF node instead. Strips/fans count n-2; lines count nothing.
+        import json
+        import struct
+        from texturecheck import preview3d
+
+        gltf = {
+            "asset": {"version": "2.0"},
+            "accessors": [{"count": 36}, {"count": 6}, {"count": 5}, {"count": 4}],
+            "meshes": [{"primitives": [{"attributes": {}, "indices": 0},
+                                       {"attributes": {}, "indices": 1},
+                                       {"attributes": {"POSITION": 2}, "mode": 5},
+                                       {"attributes": {"POSITION": 3}, "mode": 1}]}],
+            "nodes": [{"name": "Start Button", "mesh": 0}, {"name": "empty"}],
+        }
+        js = json.dumps(gltf).encode()
+        js += b" " * (-len(js) % 4)
+        glb = struct.pack("<III", 0x46546C67, 2, 20 + len(js)) + struct.pack("<II", len(js), 0x4E4F534A) + js
+        self.assertEqual(preview3d._glb_node_triangles(glb), [("start button", 12 + 2 + 3)])
+        self.assertEqual(preview3d._glb_node_triangles(b"not a glb"), [])
+
+    def test_total_counts_untextured_hidden_and_other_models(self):
+        from texturecheck import preview3d
+
+        scene = trimesh.Scene()
+        box = trimesh.creation.box(extents=[1, 1, 1])  # 12 triangles
+        for name in ("art", "plain", "hidden"):
+            scene.add_geometry(box.copy(), node_name=name, geom_name=name)
+        yaml = ("name: test\nparts:\n"
+                "  - name: art\n    art:\n      file: art.png\n"
+                "  - name: hidden\n    visible: false\n")
+        path = Path(tempfile.mkdtemp()) / "cab.zip"
+        gun = trimesh.Scene()
+        gun.add_geometry(box.copy(), node_name="gun", geom_name="gun")
+        make_zip(path, {"description.yaml": yaml.encode(), "cab.glb": scene.export(file_type="glb"),
+                        "gun.glb": gun.export(file_type="glb"), "art.png": png_bytes((64, 64))})
+        model = preview3d.build_model(str(path))
+        self.assertEqual(model.other_model_polys, {"gun.glb": 12})
+        self.assertEqual(model.total_polys, 24 + 12)  # art + plain + the whole gun model
+
+
+class PolyBudgetTest(unittest.TestCase):
+    def test_tiers(self):
+        self.assertIsNone(rules.poly_count_issue(0))
+        self.assertIsNone(rules.poly_count_issue(25_000))  # "over 25,000" is the first tier
+        cases = [
+            (25_001, rules.WARNING, "High polygon count"),
+            (100_001, rules.ERROR, "Very high polygon count"),
+            (200_001, rules.ERROR, "huge performance hit"),
+            (300_001, rules.ERROR, "risks crashing"),
+        ]
+        for total, severity, text in cases:
+            issue = rules.poly_count_issue(total)
+            self.assertEqual(issue.severity, severity, total)
+            self.assertIn(text, issue.message)
+            self.assertIn(f"{total:,}", issue.message)
+
+    def test_tiers_are_worst_first(self):
+        thresholds = [t[0] for t in rules.POLY_TIERS]
+        self.assertEqual(thresholds, sorted(thresholds, reverse=True))
+
+
 if __name__ == "__main__":
     unittest.main()

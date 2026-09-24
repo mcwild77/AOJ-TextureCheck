@@ -124,6 +124,13 @@ class App(tk.Tk):
         self.stats = ttk.Label(self, padding=(10, 0), justify="left", font=("TkDefaultFont", 11, "bold"))
         self.stats.pack(fill="x")
 
+        # The cabinet's total polygon count, below the byte totals. Turns into an orange
+        # (warning) or red (error) alert past the rules.POLY_TIERS thresholds. Filled in
+        # once the 3D model loads.
+        self.poly_label = ttk.Label(
+            self, padding=(10, 0), justify="left", font=("TkDefaultFont", 11, "bold"))
+        self.poly_label.pack(fill="x")
+
         # Custom-screen 4:3 warning, right below the totals. Red and bold when a custom
         # CRT screen mesh isn't 4:3; blank otherwise. Filled in once the 3D model loads.
         self.screen_label = ttk.Label(
@@ -192,7 +199,7 @@ class App(tk.Tk):
         self.base_image.bind("<Configure>", lambda e: self._render_previews())
         self.resized_image.bind("<Configure>", lambda e: self._render_previews())
 
-        cols = ("status", "size", "texbytes", "gpubytes", "uvusage", "recommended", "note")
+        cols = ("status", "size", "texbytes", "gpubytes", "uvusage", "polys", "recommended", "note")
         frame = ttk.Frame(split)
         split.add(frame, weight=2)
         self.tree = ttk.Treeview(frame, columns=cols, show="tree headings", selectmode="extended")
@@ -202,6 +209,7 @@ class App(tk.Tk):
         self.tree.heading("texbytes", text="Texture size")
         self.tree.heading("gpubytes", text="In-game size")
         self.tree.heading("uvusage", text="UV usage")
+        self.tree.heading("polys", text="Polygons")
         self.tree.heading("recommended", text="Recommended size")
         self.tree.heading("note", text="Issues")
         self.tree.column("#0", width=180)
@@ -210,6 +218,7 @@ class App(tk.Tk):
         self.tree.column("texbytes", width=90, anchor="e")
         self.tree.column("gpubytes", width=90, anchor="e")
         self.tree.column("uvusage", width=90, anchor="e")
+        self.tree.column("polys", width=80, anchor="e")
         self.tree.column("recommended", width=110, anchor="center")
         self.tree.column("note", width=300)
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
@@ -368,10 +377,11 @@ class App(tk.Tk):
             gpubytes = "?" if r.unreadable else human_bytes(r.ingame_bytes)
             recommended = self._recommended_text(r)
             note = self._issues_text(r)
-            uvusage = "…"  # filled in once the 3D model finishes loading (see _update_uv_column)
+            # UV usage and Polygons are filled in once the 3D model finishes loading
+            # (see _update_model_columns).
             item = self.tree.insert(
                 "", "end", text=r.name,
-                values=(SEVERITY_LABEL[r.severity], size, texbytes, gpubytes, uvusage,
+                values=(SEVERITY_LABEL[r.severity], size, texbytes, gpubytes, "…", "…",
                         recommended, note))
             self.row_report[item] = r
         self._update_totals()
@@ -786,6 +796,7 @@ class App(tk.Tk):
         self._rendered_size = None
         self.model_view.config(image="", text="Building 3D preview...", foreground="#999999")
         self.screen_label.config(text="")  # clear any previous cabinet's screen warning
+        self.poly_label.config(text="")    # ...and its polygon total
         self._load_gen += 1
         gen = self._load_gen
 
@@ -803,13 +814,25 @@ class App(tk.Tk):
         if gen != self._load_gen:
             return  # a newer cabinet was opened while this one was loading
         if err is not None or model is None or model.empty:
-            self.model_view.config(image="", text="No 3D model found in this cabinet.")
-            self._update_uv_column(None)
+            if isinstance(err, ImportError):
+                # The 3D libraries aren't installed in the Python running the app (the
+                # checker itself only needs Pillow), which is not the cabinet's fault.
+                text = ("3D preview unavailable: this Python is missing\n"
+                        f"'{err.name or err}'. Run: pip install -r requirements.txt")
+            elif err is not None:
+                text = f"Could not build the 3D preview:\n{err}"
+            else:
+                text = "No 3D model found in this cabinet."
+            self.model_view.config(image="", text=text)
+            self._update_model_columns(None)
             self._update_screen_status(None)
+            self._update_poly_status(None)
             return
-        # UV coverage comes from the CPU model build, so fill it in even if GL fails below.
-        self._update_uv_column(model)
+        # UV coverage and polygon counts come from the CPU model build, so fill them in
+        # even if GL fails below.
+        self._update_model_columns(model)
         self._update_screen_status(model)
+        self._update_poly_status(model)
         renderer = self._ensure_renderer()
         if renderer is None:
             self.model_view.config(image="", text="3D preview unavailable\n(no OpenGL on this machine).")
@@ -831,12 +854,14 @@ class App(tk.Tk):
             self._refresh_texture_preview()
             self._focus_on(self._selected_report)
 
-    def _update_uv_column(self, model):
-        # Fill the UV usage cell for each row. A percentage when we could measure it;
-        # "No UVs" when the texture is on a mesh that carries no UVs; "—" when the
-        # texture isn't mapped onto any mesh, so there's nothing to measure.
+    def _update_model_columns(self, model):
+        # Fill the UV usage and Polygons cells for each row. UV usage is a percentage
+        # when we could measure it; "No UVs" when the texture is on a mesh that carries
+        # no UVs. Polygons is the triangle count of the meshes the texture is applied
+        # to. Both read "—" when the texture isn't mapped onto any mesh.
         coverage = model.uv_coverage if model is not None else {}
         on_mesh = model.focus_targets if model is not None else {}
+        polys = model.poly_counts if model is not None else {}
         for item, report in self.row_report.items():
             name = report.name.lower()
             if name in coverage:
@@ -846,12 +871,11 @@ class App(tk.Tk):
                 self._add_no_uv_issue(report)  # note it in the Issues column too
             else:
                 text = "—"
-            values = list(self.tree.item(item, "values"))
-            values[0] = SEVERITY_LABEL[report.severity]         # status may have changed
-            values[4] = text                                    # the "uvusage" column
-            values[6] = self._issues_text(report)               # the "Issues" column
-            self.tree.item(item, values=values)
-        self._autosize_columns()  # UV usage / Issues text changed, re-fit
+            self.tree.set(item, "status", SEVERITY_LABEL[report.severity])  # may have changed
+            self.tree.set(item, "uvusage", text)
+            self.tree.set(item, "polys", f"{polys[name]:,}" if name in polys else "—")
+            self.tree.set(item, "note", self._issues_text(report))
+        self._autosize_columns()  # UV usage / Polygons / Issues text changed, re-fit
 
     def _update_screen_status(self, model):
         # Show the red 4:3 warning only when the cabinet ships a custom CRT screen mesh
@@ -862,6 +886,23 @@ class App(tk.Tk):
             self.screen_label.config(text="Warning: Custom Screentype may not be 4:3 aspect ratio!")
         else:
             self.screen_label.config(text="")
+
+    def _update_poly_status(self, model):
+        # The total polygon count, or the tiered alert when it's over budget. Blank when
+        # there's no model to count.
+        if model is None:
+            self.poly_label.config(text="")
+            return
+        # Name any extra models (e.g. a lightgun) so the builder knows where polygons are.
+        extra = ", ".join(f"{t:,} from {n}" for n, t in model.other_model_polys.items())
+        issue = rules.poly_count_issue(model.total_polys)
+        if issue is None:
+            text = f"Total polygons: {model.total_polys:,}" + (f" (includes {extra})" if extra else "")
+            self.poly_label.config(text=text, foreground="")
+        else:
+            color = "#c00000" if issue.severity == rules.ERROR else "#c06000"
+            text = issue.message + (f" Includes {extra}." if extra else "")
+            self.poly_label.config(text=text, foreground=color)
 
     def _add_no_uv_issue(self, report):
         msg = "Target mesh has no UVs, so will be flat color."

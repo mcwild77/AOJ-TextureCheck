@@ -52,6 +52,16 @@ ERROR = "error"
 WARNING = "warning"
 INFO = "info"
 
+# Whole-cabinet polygon budget: the total triangles of the cabinet model's visible
+# meshes. Worst tier first; the first threshold the total is over wins. At or below the
+# last one the cabinet is fine and nothing is flagged.
+POLY_TIERS = (
+    (300_000, ERROR, "Dangerously high polygon count", "This risks crashing the game."),
+    (200_000, ERROR, "Extremely high polygon count", "This will cause a huge performance hit."),
+    (100_000, ERROR, "Very high polygon count", ""),
+    (25_000, WARNING, "High polygon count", ""),
+)
+
 SEVERITY_ORDER = {ERROR: 0, WARNING: 1, INFO: 2}
 
 
@@ -121,4 +131,14 @@ def check_dimensions(width: int, height: int) -> list[Issue]:
 def flat_color_issue(width: int, height: int) -> Issue | None:
     if max(width, height) > FLAT_COLOR_SIZE:
         return Issue(INFO, "Flat color. Optimal: set part via color in yaml.")
+    return None
+
+
+def poly_count_issue(total: int) -> Issue | None:
+    """The cabinet-wide polygon warning for `total` triangles, or None when within budget."""
+    for threshold, severity, label, consequence in POLY_TIERS:
+        if total > threshold:
+            parts = [f"{label}: {total:,} polygons (over {threshold:,}).", consequence,
+                     "Simplify the model in your 3D editor."]
+            return Issue(severity, " ".join(p for p in parts if p))
     return None
