@@ -13,6 +13,7 @@ from . import cabinet, preview3d, resize, rules, sources
 
 PREVIEW_MAX = 320  # longest edge, in pixels, that a preview image is scaled to fit
 MODEL_MAX = 1440   # cap on the 3D render's longest edge; big enough to fill most panes
+UV_FLASH_COLOR = (255, 0, 0)  # flash color for a texture's unused UV space in the Base preview
 
 SEVERITY_LABEL = {rules.ERROR: "Fix", rules.WARNING: "Warning", rules.INFO: "Note", None: "OK"}
 
@@ -43,6 +44,12 @@ class App(tk.Tk):
         self._cam_anim_after = None     # pending camera-animation callback
         self._highlight_name = None     # texture currently flashing on the 3D model
         self._highlight = 0.0           # flash intensity, 0..1
+        self._uv_coverage = {}          # texture -> percent of it the UVs cover (from the model)
+        self._uv_tris = {}              # texture -> UV triangles, for textures with unused UV space
+        self._uv_flash_name = None      # texture whose unused UV space is flashing red in Base
+        self._uv_flash = 0.0            # that flash's intensity, 0..1
+        self._uv_mask = None            # (texture, size, mask): last unused-UV mask drawn
+        self._base_fit = None           # (source, box, image): Base texture scaled to its panel
         self._model_photo = None       # keep a ref so Tk doesn't drop the 3D image
         self._load_gen = 0             # bumps each open, so stale loads are ignored
         self._selected_report = None   # the texture whose resize preview is showing
@@ -138,6 +145,13 @@ class App(tk.Tk):
             font=("TkDefaultFont", 11, "bold"), foreground="#c00000")
         self.screen_label.pack(fill="x")
 
+        # Age of Joy cache-file (.aojv1) warning, under the screen warning. Orange; only
+        # packed while the open cabinet has cache files, so it takes no space otherwise.
+        self.cache_label = ttk.Label(
+            self, padding=(10, 0), justify="left",
+            font=("TkDefaultFont", 11, "bold"), foreground="#c06000")
+        self.cache_files: dict[str, int] = {}  # the open cabinet's .aojv1 files -> bytes
+
         # Top half: the 3D cabinet on the left (~1/3), then the selected texture with
         # its resize-target dropdowns. Bottom half: the texture list. Sashes drag.
         split = ttk.PanedWindow(self, orient="vertical")
@@ -177,8 +191,12 @@ class App(tk.Tk):
         ttk.Label(preview, text="Texture", font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
 
         pow2 = [str(n) for n in rules.power_of_two_options()]
-        controls = ttk.LabelFrame(preview, text="Resize to", padding=(10, 8))
-        controls.pack(side="bottom", fill="x", pady=(10, 0))
+        # Title and dropdowns centered: the dropdowns sit in an inner row that pack
+        # centers across the panel's width.
+        panel = ttk.LabelFrame(preview, text="Resize to", labelanchor="n", padding=(10, 8))
+        panel.pack(side="bottom", fill="x", pady=(10, 0))
+        controls = ttk.Frame(panel)
+        controls.pack()
         self.resize_w = ttk.Combobox(controls, values=pow2, width=6, state="readonly")
         self.resize_w.pack(side="left", padx=(0, 2))
         ttk.Label(controls, text="×").pack(side="left")
@@ -195,6 +213,15 @@ class App(tk.Tk):
         self.base_image, self.base_caption = self._texture_column(images, "Base", 0)
         self.resized_image, self.resized_caption = self._texture_column(images, "Resized", 1)
         self._base_photo = self._resized_photo = None  # keep refs so Tk doesn't drop them
+        # UV usage warnings, under the Base texture only. They get their own grid row so
+        # a long warning never squeezes the Base image smaller than the Resized one.
+        # Hidden (grid_remove) when there's nothing to say, so it takes no space.
+        self.uv_warning = ttk.Label(
+            images, text="", justify="center", anchor="center", wraplength=PREVIEW_MAX,
+            font=("TkDefaultFont", 11, "bold"))
+        self.uv_warning.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 0))
+        self.uv_warning.grid_remove()
+        self.uv_warning.bind("<Configure>", self._wrap_uv_warning)
         # Re-fit the preview images whenever their area changes (window / sash resize).
         self.base_image.bind("<Configure>", lambda e: self._render_previews())
         self.resized_image.bind("<Configure>", lambda e: self._render_previews())
@@ -255,7 +282,8 @@ class App(tk.Tk):
         frame = ttk.Frame(parent)
         frame.grid(row=0, column=col, sticky="nsew", padx=6)
         ttk.Label(frame, text=title, foreground="#555555").pack(side="top")
-        caption = ttk.Label(frame, text="", wraplength=PREVIEW_MAX, justify="center")
+        # anchor centers the line in the column's width; justify centers wrapped lines.
+        caption = ttk.Label(frame, text="", wraplength=PREVIEW_MAX, justify="center", anchor="center")
         caption.pack(side="bottom", fill="x", pady=(4, 0))
         holder = ttk.Frame(frame)
         holder.pack(side="top", fill="both", expand=True, pady=6)
@@ -288,8 +316,26 @@ class App(tk.Tk):
         self.export_zip_btn.config(state="normal")
         self.export_name.delete(0, "end")
         self.export_name.insert(0, sources.default_export_name(path))
+        self._update_cache_warning(path)
         self._populate()
         self._load_model(path)
+
+    def _update_cache_warning(self, path):
+        # Show the .aojv1 line when the cabinet carries Age of Joy cache files (usually a
+        # folder opened straight out of the game's cabinetsdb); hide it otherwise.
+        try:
+            self.cache_files = cabinet.aoj_cache_files(path)
+        except Exception:
+            self.cache_files = {}
+        n = len(self.cache_files)
+        if not n:
+            self.cache_label.pack_forget()
+            return
+        self.cache_label.config(
+            text=f"Warning: Found {n} Age of Joy cache file{'s' if n != 1 else ''} "
+                 f"(.aojv1, {human_bytes(sum(self.cache_files.values()))}). The game makes "
+                 f"these itself, so don't share them. Exports leave them out automatically.")
+        self.cache_label.pack(fill="x", after=self.screen_label)
 
     def _export_targets(self) -> dict[str, tuple[int, int]]:
         """The textures the export should re-encode: name -> new size, for every texture
@@ -327,7 +373,8 @@ class App(tk.Tk):
         if not self.cabinet_path:
             return
         parent = filedialog.askdirectory(
-            title="Choose where to save the new folder", mustexist=True)
+            title="Choose where to save the new folder", mustexist=True,
+            initialdir=self._export_dialog_dir())
         if not parent:
             return
         dest = Path(parent) / self._export_base_name()
@@ -347,7 +394,8 @@ class App(tk.Tk):
             name = name[:-4]
         dest = filedialog.asksaveasfilename(
             title="Export cabinet as a zip", defaultextension=".zip",
-            initialfile=f"{name}.zip", filetypes=[("Cabinet zip", "*.zip")])
+            initialfile=f"{name}.zip", initialdir=self._export_dialog_dir(),
+            filetypes=[("Cabinet zip", "*.zip")])
         if not dest:
             return
         try:
@@ -357,9 +405,18 @@ class App(tk.Tk):
             return
         self._show_export_done(out)
 
+    def _export_dialog_dir(self) -> str:
+        # Start the export dialogs NEXT TO the cabinet, not inside it. Left to itself
+        # Windows opens the last folder used, which after "Open cabinet (folder)" is the
+        # cabinet folder -- and an export saved there lands inside the cabinet.
+        return str(Path(self.cabinet_path).parent)
+
     def _show_export_done(self, out):
         footprint = self._footprint_message()
         lines = [f"Saved to:\n{out}", "Your original cabinet is untouched."]
+        if self.cache_files:
+            n = len(self.cache_files)
+            lines.append(f"Left out {n} Age of Joy cache file{'s' if n != 1 else ''} (.aojv1).")
         if footprint:
             lines.append(footprint)
         messagebox.showinfo("Exported", "\n\n".join(lines))
@@ -393,10 +450,11 @@ class App(tk.Tk):
         self._autosize_columns()
 
     def _issues_text(self, report) -> str:
-        # The "Issues" cell: each issue's message joined into one string, with the
-        # "Unreferenced in description.yaml." note always rendered first.
+        # The "Issues" cell: each issue's message joined into one string, led by
+        # "Huge texture." and then the "Unreferenced in description.yaml." note.
         messages = [i.message for i in report.issues]
-        messages.sort(key=lambda m: 0 if m.startswith("Unreferenced in description.yaml") else 1)
+        messages.sort(key=lambda m: 0 if m == rules.HUGE_MESSAGE
+                      else 1 if m.startswith("Unreferenced in description.yaml") else 2)
         # When we suggest a smaller size (a non-blank "Recommended size"), nudge the user.
         if self._recommended_text(report):
             messages.append("Consider resizing.")
@@ -527,27 +585,39 @@ class App(tk.Tk):
         step()
 
     def _flash_texture(self, report: "cabinet.TextureReport"):
-        # Flash the selected texture yellow on the 3D model three times within one
-        # second, so the eye is drawn to which part uses it. Six ~166ms steps
-        # (on/off x3) fill the second; the last step clears the tint.
+        # Flash the selected texture three times within one second: yellow on the 3D
+        # model, so the eye is drawn to which part uses it, and red over the Base
+        # preview's unused UV space, to call out texture area the model wastes. Both
+        # share one timer: six ~166ms steps (on/off x3), the last clearing the tints.
         if self._flash_after is not None:
             self.after_cancel(self._flash_after)
             self._flash_after = None
         name = report.name.lower()
-        # Only textures applied to a mesh can flash; others have nothing to tint.
-        if self.model is None or self.renderer is None or name not in self.model.focus_targets:
-            self._highlight_name, self._highlight = None, 0.0
+        # Only textures applied to a mesh can flash on the model, and only ones whose
+        # UVs leave part of the map unused have any red to show.
+        on_model = (self.model is not None and self.renderer is not None
+                    and name in self.model.focus_targets)
+        on_uvs = name in self._uv_tris
+        self._highlight_name = name if on_model else None
+        self._uv_flash_name = name if on_uvs else None
+        self._highlight = self._uv_flash = 0.0
+        if not (on_model or on_uvs):
             return
-        self._highlight_name = name
         amounts = [0.8, 0.0, 0.8, 0.0, 0.8, 0.0]
 
         def step(i=0):
-            self._highlight = amounts[i]
-            self._render_model()
+            if on_model:
+                self._highlight = amounts[i]
+                self._render_model()
+            if on_uvs:
+                self._uv_flash = amounts[i]
+                self._render_previews()
             if i + 1 < len(amounts):
                 self._flash_after = self.after(166, lambda: step(i + 1))
             else:
-                self._highlight, self._highlight_name, self._flash_after = 0.0, None, None
+                self._highlight, self._highlight_name = 0.0, None
+                self._uv_flash, self._uv_flash_name = 0.0, None
+                self._flash_after = None
 
         step()
 
@@ -565,6 +635,7 @@ class App(tk.Tk):
     def _refresh_texture_preview(self):
         """Show the base texture and its resized result side by side (2D box)."""
         self._preview_sig = None  # content changed: force the next _render_previews to redraw
+        self._update_uv_warning()
         report = self._selected_report
         if report is None:
             self._base_src = self._resized_src = None
@@ -601,6 +672,29 @@ class App(tk.Tk):
         self._render_previews()
         self._apply_3d_overrides()
 
+    def _update_uv_warning(self):
+        # Warn under the Base texture when the selected texture's UVs leave too much of
+        # it unused (tiers in rules.UV_USAGE_TIERS). Red for the errors, orange for a
+        # plain warning; hidden when the usage is fine or not measured (tiled, no model).
+        report = self._selected_report
+        usage = None if report is None or report.unreadable else self._uv_coverage.get(report.name.lower())
+        issues = [] if usage is None else rules.uv_usage_issues(usage, report.width, report.height)
+        if not issues:
+            self.uv_warning.config(text="")
+            self.uv_warning.grid_remove()
+            return
+        color = "#c00000" if any(i.severity == rules.ERROR for i in issues) else "#c06000"
+        self.uv_warning.config(text="\n".join(i.message for i in issues), foreground=color)
+        self.uv_warning.grid()
+
+    def _wrap_uv_warning(self, event):
+        # Wrap the warning to its column's width (grid sets the label's width), so it
+        # breaks into lines instead of pushing the column wider. Only on a real change,
+        # since re-wrapping resizes the label and fires <Configure> again.
+        width = max(100, event.width - 4)
+        if str(self.uv_warning.cget("wraplength")) != str(width):
+            self.uv_warning.configure(wraplength=width)
+
     def _render_previews(self):
         """(Re)build the base/resized preview images sized to the panel's current area.
 
@@ -612,16 +706,22 @@ class App(tk.Tk):
         """
         base_box = self._preview_box(self.base_image) if self._base_src is not None else None
         resized_box = self._preview_box(self.resized_image) if self._resized_src is not None else None
-        sig = (id(self._base_src), base_box, id(self._resized_src), resized_box, self._resized_no_change)
+        report = self._selected_report
+        # The unused-UV flash belongs to one texture; never tint a different one.
+        flash = (self._uv_flash if report is not None and report.name.lower() == self._uv_flash_name
+                 else 0.0)
+        sig = (id(self._base_src), base_box, id(self._resized_src), resized_box,
+               self._resized_no_change, flash)
         if sig == self._preview_sig:
             return
         self._preview_sig = sig
         self._base_photo = self._resized_photo = None
         if self._base_src is None:
+            self._base_fit = None
             self.base_image.config(image="")
             self.resized_image.config(image="")
             return
-        self._base_photo = self._display_photo(self._base_src, base_box)
+        self._base_photo = self._base_preview_photo(base_box, flash)
         self.base_image.config(image=self._base_photo)
         if self._resized_src is not None:
             self._resized_photo = self._display_photo(
@@ -654,10 +754,37 @@ class App(tk.Tk):
                     return part.texture
         return self._load_image(name)
 
+    def _base_preview_photo(self, box, flash: float) -> "ImageTk.PhotoImage":
+        # The Base texture, with its unused UV space tinted red by `flash` (0..1). The
+        # scaled image and the mask are cached, so each flash step is just a blend:
+        # scaling a big texture or rasterizing a dense mesh's UVs can take ~100ms,
+        # which would throw off the flash's rhythm.
+        src = self._base_src
+        if self._base_fit is None or self._base_fit[0] is not src or self._base_fit[1] != box:
+            self._base_fit = (src, box, self._fit_image(src, box))
+        img = self._base_fit[2]
+        if flash > 0:
+            name = self._uv_flash_name
+            if self._uv_mask is None or self._uv_mask[:2] != (name, img.size):
+                self._uv_mask = (name, img.size, preview3d.uv_mask(self._uv_tris[name], img.size))
+            red = Image.blend(img, Image.new("RGB", img.size, UV_FLASH_COLOR), flash)
+            img = Image.composite(img, red, self._uv_mask[2])  # used UV space keeps its art
+        return self._framed_photo(img)
+
     def _display_photo(self, img: "Image.Image", box, sharp: bool = False,
                        dim: bool = False) -> "ImageTk.PhotoImage":
-        # Composite alpha onto white for the panel, then a 1px grey frame so the
-        # texture's edges show even when it is white/transparent.
+        img = self._fit_image(img, box, sharp)
+        if dim:
+            # Wash it toward light grey so it reads as inactive ("nothing to change here").
+            img = Image.blend(img, Image.new("RGB", img.size, (235, 235, 235)), 0.6)
+        return self._framed_photo(img)
+
+    def _framed_photo(self, img: "Image.Image") -> "ImageTk.PhotoImage":
+        # A 1px grey frame so the texture's edges show even when it is white/transparent.
+        return ImageTk.PhotoImage(ImageOps.expand(img, border=1, fill=(180, 180, 180)))
+
+    def _fit_image(self, img: "Image.Image", box, sharp: bool = False) -> "Image.Image":
+        # Composite alpha onto white for the panel.
         if img.mode == "RGBA":
             bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
             img = Image.alpha_composite(bg, img).convert("RGB")
@@ -673,11 +800,7 @@ class App(tk.Tk):
         if scale != 1:
             resample = Image.NEAREST if (scale > 1 and sharp) else Image.LANCZOS
             img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), resample)
-        if dim:
-            # Wash it toward light grey so it reads as inactive ("nothing to change here").
-            img = Image.blend(img, Image.new("RGB", img.size, (235, 235, 235)), 0.6)
-        img = ImageOps.expand(img, border=1, fill=(180, 180, 180))
-        return ImageTk.PhotoImage(img)
+        return img
 
     def _resized_texture(self, name, source, size):
         """Resize `source` to `size`, cached in memory by (name, size)."""
@@ -792,6 +915,8 @@ class App(tk.Tk):
             self.after_cancel(self._flash_after)
             self._flash_after = None
         self._highlight_name, self._highlight = None, 0.0
+        self._uv_coverage, self._uv_tris, self._uv_mask = {}, {}, None
+        self._uv_flash_name, self._uv_flash = None, 0.0
         self._model_photo = None
         self._rendered_size = None
         self.model_view.config(image="", text="Building 3D preview...", foreground="#999999")
@@ -833,6 +958,12 @@ class App(tk.Tk):
         self._update_model_columns(model)
         self._update_screen_status(model)
         self._update_poly_status(model)
+        # Also CPU-side, so the unused-UV flash and warnings work without GL. Textures
+        # whose UVs cover the whole map have nothing to flash.
+        self._uv_coverage = model.uv_coverage
+        self._uv_tris = {name: tris for name, tris in model.uv_tris.items()
+                         if model.uv_coverage.get(name, 100.0) < 100.0}
+        self._update_uv_warning()  # a texture may have been selected while this loaded
         renderer = self._ensure_renderer()
         if renderer is None:
             self.model_view.config(image="", text="3D preview unavailable\n(no OpenGL on this machine).")
@@ -856,16 +987,20 @@ class App(tk.Tk):
 
     def _update_model_columns(self, model):
         # Fill the UV usage and Polygons cells for each row. UV usage is a percentage
-        # when we could measure it; "No UVs" when the texture is on a mesh that carries
-        # no UVs. Polygons is the triangle count of the meshes the texture is applied
-        # to. Both read "—" when the texture isn't mapped onto any mesh.
+        # when we could measure it; "Tiled" when the texture repeats across its mesh (so
+        # all of it is used); "No UVs" when it is on a mesh that carries no UVs. Polygons
+        # is the triangle count of the meshes the texture is applied to. Both read "—"
+        # when the texture isn't mapped onto any mesh.
         coverage = model.uv_coverage if model is not None else {}
+        tiled = model.uv_tiled if model is not None else set()
         on_mesh = model.focus_targets if model is not None else {}
         polys = model.poly_counts if model is not None else {}
         for item, report in self.row_report.items():
             name = report.name.lower()
             if name in coverage:
                 text = f"{coverage[name]:.0f}%"
+            elif name in tiled:
+                text = "Tiled"
             elif name in on_mesh:
                 text = "No UVs"
                 self._add_no_uv_issue(report)  # note it in the Issues column too

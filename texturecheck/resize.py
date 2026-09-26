@@ -73,13 +73,33 @@ def targets_for(reports: list[TextureReport]) -> dict[str, tuple[int, int]]:
     return {r.name: r.target_size for r in reports if r.needs_resize}
 
 
+def _names_to_copy(names: list[str]) -> list[str]:
+    """The cabinet files an export copies: all of them except ones that must not ship.
+
+    Left out: Age of Joy cache files (`*.aojv1`); any `.zip` (a cabinet never contains
+    one, so it is an earlier export saved into the cabinet folder); and any nested
+    cabinet, i.e. a subfolder with its own description.yaml inside the cabinet's
+    (an earlier "Export to New Folder" saved into the cabinet folder).
+    """
+    def inside(name, folder):  # folder "" is the source's root
+        return not folder or name.startswith(folder + "/")
+
+    yaml_dirs = {n.rpartition("/")[0] for n in names
+                 if n.rsplit("/", 1)[-1].lower() == "description.yaml"}
+    nested = [d for d in yaml_dirs if any(e != d and inside(d, e) for e in yaml_dirs)]
+    return [n for n in names
+            if not sources.is_aoj_cache(n)
+            and not n.lower().endswith(".zip")
+            and not any(inside(n, d) for d in nested)]
+
+
 def export_folder(src_path, dest_dir, targets: dict[str, tuple[int, int]]) -> Path:
     """Duplicate a cabinet (zip or folder) into a NEW folder, resizing `targets`.
 
-    Every file is copied across; the textures named in `targets` are re-encoded at
-    their new size, everything else byte-for-byte. Nondestructive: the source is
-    never touched, and this refuses to write into an existing folder or the source.
-    Returns the created folder.
+    Every file is copied across (bar the leftovers `_names_to_copy` drops); the
+    textures named in `targets` are re-encoded at their new size, everything else
+    byte-for-byte. Nondestructive: the source is never touched, and this refuses to
+    write into an existing folder or the source. Returns the created folder.
     """
     src, dest = Path(src_path), Path(dest_dir)
     if dest.exists():
@@ -87,7 +107,8 @@ def export_folder(src_path, dest_dir, targets: dict[str, tuple[int, int]]) -> Pa
     if src.is_dir() and src.resolve() == dest.resolve():
         raise ValueError("The export folder must be different from the source.")
     with sources.open_source(src_path) as source:
-        names = source.namelist()  # read the list before we create anything under dest
+        # Read the list before we create anything under dest, which may sit inside src.
+        names = _names_to_copy(source.namelist())
         dest.mkdir(parents=True)
         for name in names:
             data = source.read(name)
@@ -109,11 +130,14 @@ def export_zip(src_path, dest_zip, targets: dict[str, tuple[int, int]]) -> Path:
     src, dest = Path(src_path), Path(dest_zip)
     if not src.is_dir() and src.resolve() == dest.resolve():
         raise ValueError("The export zip must be a different file than the source.")
-    with sources.open_source(src_path) as source, \
-            zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as dst:
-        for name in source.namelist():
-            data = source.read(name)
-            if name in targets:
-                data = resize_image_bytes(data, targets[name])
-            dst.writestr(name, data)
+    with sources.open_source(src_path) as source:
+        # Read the list BEFORE creating the zip: when it is saved inside a folder
+        # cabinet, listing afterwards would pack the half-written zip into itself.
+        names = _names_to_copy(source.namelist())
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as dst:
+            for name in names:
+                data = source.read(name)
+                if name in targets:
+                    data = resize_image_bytes(data, targets[name])
+                dst.writestr(name, data)
     return dest

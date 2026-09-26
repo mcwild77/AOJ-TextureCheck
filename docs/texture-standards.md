@@ -42,7 +42,7 @@ Width and height are checked independently. They do not need to match each other
 Not from the source page. This is what `texturecheck/rules.py` and `texturecheck/cabinet.py` implement, so change both together.
 
 - **Error**: either dimension is not a power of two, or the image cannot be read. The tool suggests the largest power of two that fits on each side (rounding down, so it only ever shrinks), capped at 4096.
-- **Warning**: a power-of-two texture larger than 4096 on either side.
+- **Warning**: a power-of-two texture larger than 4096 on either side. Separately, any texture over 2100 pixels on either side (flat color included) gets "Huge texture." as its first issue. That threshold came from the project owner.
 - **Info**: the texture looks like a flat color (4 or fewer distinct colors) but is larger than 8x8, or it is not referenced by `description.yaml`.
 
 ### Polygon budget
@@ -55,5 +55,17 @@ Also not from the source page. The thresholds came from the project owner. The t
 | 100,000 | Error | Very high polygon count |
 | 200,000 | Error | Extremely high: a huge performance hit |
 | 300,000 | Error | Dangerously high: risks crashing the game |
+
+### UV usage
+
+Also not from the source page. The thresholds came from the project owner. UV usage is the percent of a texture that the UVs of its mesh cover (the rest costs memory in game but is never seen). A texture whose UVs run more than 0.02 past the 0–1 map repeats (tiles) across its mesh, so all of it is used; it shows as "Tiled" and is not judged. The selected texture gets a warning under its Base preview for the lowest tier its usage is under:
+
+| Usage under | Severity | Meaning |
+|---|---|---|
+| 50% | Warning | Bad UV usage |
+| 25% | Error | Extremely bad UV usage |
+| 10% | Error | Critically bad UV usage |
+
+Under 25%, a texture over 1024 pixels on either side also gets a warning that the unused space will result in extremely high memory usage.
 
 Not implemented yet: flagging `.astc` files, and judging a texture's size against the component's likely role.

@@ -10,6 +10,15 @@ adapter mimics them).
 import zipfile
 from pathlib import Path
 
+# Age of Joy writes a converted copy of each texture (e.g. `bezel.png.aojv1`) next to
+# an installed cabinet's files. The game makes these itself, so they never ship.
+AOJ_CACHE_SUFFIX = ".aojv1"
+
+
+def is_aoj_cache(name: str) -> bool:
+    """True for an Age of Joy texture cache file such as `bezel.png.aojv1`."""
+    return name.lower().endswith(AOJ_CACHE_SUFFIX)
+
 
 class ZipCabinet:
     """A cabinet read from a .zip file."""
@@ -22,6 +31,9 @@ class ZipCabinet:
 
     def read(self, name: str) -> bytes:
         return self._zf.read(name)
+
+    def size(self, name: str) -> int:
+        return self._zf.getinfo(name).file_size
 
     def close(self):
         self._zf.close()
@@ -45,6 +57,9 @@ class FolderCabinet:
 
     def read(self, name: str) -> bytes:
         return (self._root / name).read_bytes()
+
+    def size(self, name: str) -> int:
+        return (self._root / name).stat().st_size
 
     def __enter__(self):
         return self

@@ -66,6 +66,12 @@ class CabinetModel:
     focus_targets: dict = field(default_factory=dict)
     # texture filename (lowercased basename) -> percent of the texture map its UVs cover.
     uv_coverage: dict = field(default_factory=dict)
+    # texture filename (lowercased basename) -> the raw GLB UV triangles behind that
+    # percent, [(uv (nv,2), faces (nf,3)), ...], so the GUI can draw the unused area.
+    uv_tris: dict = field(default_factory=dict)
+    # texture filenames whose UVs run past the 0..1 map: the texture repeats (tiles), so
+    # it has no unused space and is left out of uv_coverage / uv_tris.
+    uv_tiled: set = field(default_factory=set)
     # texture filename (lowercased basename) -> triangle count of the visible mesh(es)
     # it is applied to (summed when several parts share one texture).
     poly_counts: dict = field(default_factory=dict)
@@ -376,7 +382,12 @@ def build_model(zip_path: str) -> CabinetModel:
             continue
         key = override.rsplit("/", 1)[-1].lower()
         cov_tris.setdefault(key, []).extend(prims)
+    # A tiled texture is on show everywhere; clipping its UVs to the map would read as
+    # waste (a repeating red paint measured 4%), so it isn't measured at all.
+    model.uv_tiled = {name for name, tris in cov_tris.items() if _uvs_tile(tris)}
+    cov_tris = {name: tris for name, tris in cov_tris.items() if name not in model.uv_tiled}
     model.uv_coverage = {name: _uv_coverage(tris) for name, tris in cov_tris.items()}
+    model.uv_tris = cov_tris
     # Triangles for the whole cabinet and per texture, from the same GLB node names.
     # Hidden parts don't draw in game, so they don't count.
     model.total_polys = sum(model.other_model_polys.values())
@@ -395,19 +406,38 @@ def _uv_coverage(tris, grid: int = 256) -> float:
     """Percent of the 0..1 texture map covered by the mesh's UV triangles.
 
     The UV triangles are rasterized into a `grid`x`grid` mask and the filled
-    fraction is returned. UVs outside 0..1 are clipped to the map, so a low
-    number means much of the texture is unused and could be shrunk or repacked.
+    fraction is returned. UVs outside 0..1 are clipped to the map (tiled textures
+    are screened out first, see _uvs_tile), so a low number means much of the
+    texture is unused and could be shrunk or repacked.
+    """
+    covered = int(np.count_nonzero(np.asarray(uv_mask(tris, (grid, grid)))))
+    return 100.0 * covered / (grid * grid)
+
+
+def _uvs_tile(tris) -> bool:
+    """True when the UVs run past the 0..1 map by more than modeling slop, i.e. the
+    texture repeats across the mesh."""
+    lo, hi = -rules.UV_TILE_TOLERANCE, 1 + rules.UV_TILE_TOLERANCE
+    return any(len(uv) and (uv.min() < lo or uv.max() > hi) for uv, _ in tris)
+
+
+def uv_mask(tris, size) -> Image.Image:
+    """An "L" mask of `size` (w, h): 255 where the UV triangles land on the texture, 0 elsewhere.
+
+    glTF UVs put (0, 0) at the image's top-left, so the raw GLB UVs scale straight to
+    pixels and the mask lines up with the texture image as it is displayed.
     """
     from PIL import ImageDraw
 
-    mask = Image.new("L", (grid, grid), 0)
+    w, h = size
+    mask = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask)
+    scale = np.array([w, h], np.float32)
     for uv, faces in tris:
-        pts = uv * grid
+        pts = uv * scale
         for f in faces:
             draw.polygon([(float(pts[i, 0]), float(pts[i, 1])) for i in f], fill=255)
-    covered = int(np.count_nonzero(np.asarray(mask)))
-    return 100.0 * covered / (grid * grid)
+    return mask
 
 
 # glTF component/type tables: componentType -> (numpy dtype, byte size); type -> n components.

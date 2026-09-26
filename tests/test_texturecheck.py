@@ -114,6 +114,22 @@ class CabinetTest(unittest.TestCase):
         self.assertEqual(r.target_size, (8, 8))  # a flat color only needs 8x8
         self.assertEqual(r.recommended_size, (8, 8))
 
+    def test_huge_texture_leads_the_issues(self):
+        flat = io.BytesIO()
+        Image.new("RGB", (2290, 640), (10, 20, 30)).save(flat, "PNG")
+        make_zip(self.zip, {
+            "wide.png": png_bytes((2101, 64)),    # also not a power of two
+            "tall.png": png_bytes((256, 4096)),   # a power of two, still huge
+            "flat.png": flat.getvalue(),          # flat color counts too
+            "fine.png": png_bytes((2048, 2048)),  # 2100 is the line, not 2048
+        })
+        r = {r.name: r for r in cabinet.check_cabinet(self.zip)}
+        for name in ("wide.png", "tall.png", "flat.png"):
+            self.assertEqual(r[name].issues[0].message, rules.HUGE_MESSAGE, name)
+        self.assertEqual(r["tall.png"].severity, rules.WARNING)
+        self.assertEqual(len(r["wide.png"].issues), 2)  # the power-of-two error remains
+        self.assertEqual(r["fine.png"].issues, [])
+
     def test_recommended_size_keeps_detailed_texture(self):
         # Full random noise has real detail at every scale: nothing smaller is faithful.
         noise = Image.frombytes("RGB", (256, 256), os.urandom(256 * 256 * 3))
@@ -252,6 +268,96 @@ class ExportTest(unittest.TestCase):
             make_zip(src, {"a.png": png_bytes((100, 100))})
             with self.assertRaises(ValueError):
                 resize.export_zip(src, src, {})
+
+    def _folder(self, tmp, extra=None):
+        src = Path(tmp) / "cab"
+        src.mkdir()
+        for name, data in {**self.FILES, **(extra or {})}.items():
+            (src / name).parent.mkdir(parents=True, exist_ok=True)
+            (src / name).write_bytes(data)
+        return src
+
+    def test_export_zip_saved_inside_source_folder_does_not_pack_itself(self):
+        # The reported bug: a folder cabinet exported to a zip inside that same folder
+        # came out holding a broken, half-written copy of itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._folder(tmp)
+            out = resize.export_zip(str(src), src / "cab_optimized.zip", {})
+            with zipfile.ZipFile(out) as zf:
+                self.assertEqual(sorted(zf.namelist()), sorted(self.FILES))
+            # Exporting again over the same file doesn't pick up the previous export.
+            out = resize.export_zip(str(src), src / "cab_optimized.zip", {})
+            with zipfile.ZipFile(out) as zf:
+                self.assertEqual(sorted(zf.namelist()), sorted(self.FILES))
+
+    def test_export_skips_earlier_exports_inside_source_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._folder(tmp, {
+                "description.yaml": b"name: cab",
+                "old_optimized.zip": b"PK not really",
+                "cab_optimized/description.yaml": b"name: cab",  # an earlier folder export
+                "cab_optimized/big.png": png_bytes((512, 256)),
+            })
+            expected = sorted([*self.FILES, "description.yaml"])
+            with zipfile.ZipFile(resize.export_zip(str(src), Path(tmp) / "out.zip", {})) as zf:
+                self.assertEqual(sorted(zf.namelist()), expected)
+            out = resize.export_folder(str(src), Path(tmp) / "out", {})
+            self.assertEqual(sorted(p.name for p in out.iterdir()), expected)
+
+    def test_export_keeps_cabinet_nested_one_folder_down(self):
+        # A zip whose files sit under one top folder is still a normal cabinet.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "a.zip")
+            make_zip(src, {"cab/description.yaml": b"name: cab", "cab/ok.png": self.FILES["ok.png"]})
+            with zipfile.ZipFile(resize.export_zip(src, Path(tmp) / "out.zip", {})) as zf:
+                self.assertEqual(sorted(zf.namelist()), ["cab/description.yaml", "cab/ok.png"])
+
+
+class AojCacheTest(unittest.TestCase):
+    """Age of Joy writes `<texture>.aojv1` caches next to an installed cabinet's art.
+    They must be detected (for the GUI warning) and never exported."""
+    FILES = {
+        "bezel.png": png_bytes((256, 256)),
+        "bezel.png.aojv1": b"\x00" * 3000,
+        "joystick.png.AOJV1": b"\x00" * 500,  # extension match is case-insensitive
+        "notes.bas": b"print 1",
+    }
+    CACHES = {"bezel.png.aojv1": 3000, "joystick.png.AOJV1": 500}
+
+    def test_detected_in_folder_and_zip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "cab"
+            folder.mkdir()
+            for name, data in self.FILES.items():
+                (folder / name).write_bytes(data)
+            zip_path = os.path.join(tmp, "cab.zip")
+            make_zip(zip_path, self.FILES)
+            self.assertEqual(cabinet.aoj_cache_files(str(folder)), self.CACHES)
+            self.assertEqual(cabinet.aoj_cache_files(zip_path), self.CACHES)
+
+    def test_none_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "cab.zip")
+            make_zip(zip_path, {"bezel.png": png_bytes((256, 256))})
+            self.assertEqual(cabinet.aoj_cache_files(zip_path), {})
+
+    def test_not_checked_as_textures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "cab.zip")
+            make_zip(zip_path, self.FILES)
+            self.assertEqual([r.name for r in cabinet.check_cabinet(zip_path)], ["bezel.png"])
+
+    def test_left_out_of_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "cab"
+            folder.mkdir()
+            for name, data in self.FILES.items():
+                (folder / name).write_bytes(data)
+            expected = ["bezel.png", "notes.bas"]
+            with zipfile.ZipFile(resize.export_zip(str(folder), Path(tmp) / "out.zip", {})) as zf:
+                self.assertEqual(sorted(zf.namelist()), expected)
+            out = resize.export_folder(str(folder), Path(tmp) / "out", {})
+            self.assertEqual(sorted(p.name for p in out.iterdir()), expected)
 
 
 @unittest.skipUnless(SAMPLES.exists(), "sample cabinets not present")
@@ -460,6 +566,47 @@ class PolyBudgetTest(unittest.TestCase):
     def test_tiers_are_worst_first(self):
         thresholds = [t[0] for t in rules.POLY_TIERS]
         self.assertEqual(thresholds, sorted(thresholds, reverse=True))
+
+
+class UvUsageTest(unittest.TestCase):
+    def test_tiers(self):
+        self.assertEqual(rules.uv_usage_issues(50, 512, 512), [])  # "under 50%" is the first tier
+        self.assertEqual(rules.uv_usage_issues(100, 4096, 4096), [])
+        cases = [
+            (49.6, rules.WARNING, "Bad UV usage", "50%"),
+            (24.6, rules.ERROR, "Extremely bad UV usage", "75%"),
+            (8.4, rules.ERROR, "Critically bad UV usage", "92%"),
+        ]
+        for usage, severity, label, unused in cases:
+            issues = rules.uv_usage_issues(usage, 512, 512)
+            self.assertEqual(len(issues), 1, usage)  # small texture: no memory warning
+            self.assertEqual(issues[0].severity, severity, usage)
+            self.assertIn(label, issues[0].message)
+            self.assertIn(f"{unused} of this texture is unused", issues[0].message)
+
+    def test_memory_warning_needs_low_usage_and_a_big_texture(self):
+        def memory_warned(usage, w, h):
+            return any("memory" in i.message for i in rules.uv_usage_issues(usage, w, h))
+        self.assertTrue(memory_warned(8, 2290, 640))     # instructions.png: 2290 wide, 8% used
+        self.assertTrue(memory_warned(24.9, 640, 2048))  # the tall side counts too
+        self.assertFalse(memory_warned(8, 1024, 1024))   # "over 1024" means 1024 itself is fine
+        self.assertFalse(memory_warned(30, 4096, 4096))  # bad, but not under 25%
+
+    def test_tiers_are_worst_first(self):
+        thresholds = [t[0] for t in rules.UV_USAGE_TIERS]
+        self.assertEqual(thresholds, sorted(thresholds))
+
+    @unittest.skipUnless(HAS_TRIMESH, "trimesh not installed")
+    def test_tiled_uvs_are_not_measured(self):
+        import numpy as np
+        from texturecheck import preview3d
+        faces = np.array([[0, 1, 2]])
+        strip = [(np.array([[0, 0], [0.2, 0], [0, 1]], np.float32), faces)]
+        tiled = [(np.array([[-3, 0], [5, 0], [0, 4]], np.float32), faces)]
+        slop = [(np.array([[-0.01, 0], [1.01, 0], [0, 1]], np.float32), faces)]
+        self.assertFalse(preview3d._uvs_tile(strip))
+        self.assertTrue(preview3d._uvs_tile(tiled))
+        self.assertFalse(preview3d._uvs_tile(slop))  # modeling slop just past the edge
 
 
 if __name__ == "__main__":

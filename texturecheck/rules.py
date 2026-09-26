@@ -4,6 +4,9 @@ import math
 from dataclasses import dataclass
 
 MAX_SIZE = 4096
+# Over this many pixels on either side, a texture leads its Issues with HUGE_MESSAGE.
+HUGE_SIZE = 2100
+HUGE_MESSAGE = "Huge texture."
 FLAT_COLOR_SIZE = 8
 FLAT_COLOR_MAX_COLORS = 4
 
@@ -61,6 +64,21 @@ POLY_TIERS = (
     (100_000, ERROR, "Very high polygon count", ""),
     (25_000, WARNING, "High polygon count", ""),
 )
+
+# UV usage: the percent of a texture's map that its mesh's UVs cover. The rest costs
+# memory in game but is never seen. Worst tier first; the first threshold the usage is
+# under wins. At or above the last one nothing is flagged.
+UV_USAGE_TIERS = (
+    (10, ERROR, "Critically bad UV usage"),
+    (25, ERROR, "Extremely bad UV usage"),
+    (50, WARNING, "Bad UV usage"),
+)
+# Under this usage, a texture over UV_MEMORY_SIZE on either side also gets a memory warning.
+UV_MEMORY_USAGE = 25
+UV_MEMORY_SIZE = 1024
+# UVs this far past the 0..1 map mean the texture repeats (tiles) across its mesh, so
+# every pixel is on show and "unused space" doesn't apply. Anything closer is modeling slop.
+UV_TILE_TOLERANCE = 0.02
 
 SEVERITY_ORDER = {ERROR: 0, WARNING: 1, INFO: 2}
 
@@ -128,6 +146,12 @@ def check_dimensions(width: int, height: int) -> list[Issue]:
     return issues
 
 
+def huge_texture_issue(width: int, height: int) -> Issue | None:
+    if max(width, height) > HUGE_SIZE:
+        return Issue(WARNING, HUGE_MESSAGE)
+    return None
+
+
 def flat_color_issue(width: int, height: int) -> Issue | None:
     if max(width, height) > FLAT_COLOR_SIZE:
         return Issue(INFO, "Flat color. Optimal: set part via color in yaml.")
@@ -142,3 +166,21 @@ def poly_count_issue(total: int) -> Issue | None:
                      "Simplify the model in your 3D editor."]
             return Issue(severity, " ".join(p for p in parts if p))
     return None
+
+
+def uv_usage_issues(usage: float, width: int, height: int) -> list[Issue]:
+    """Warnings for a width x height texture whose UVs cover only `usage` percent of it:
+    the tier message, then a memory warning when it is big as well. Empty when fine."""
+    for threshold, severity, label in UV_USAGE_TIERS:
+        if usage < threshold:
+            break
+    else:
+        return []
+    unused = 100 - round(usage)  # matches the rounded "UV usage" column
+    issues = [Issue(severity, f"{label}: {unused}% of this texture is unused (the area that "
+                              "flashes red). Crop the texture to the part the model uses and "
+                              "scale the UVs up to fill it.")]
+    if usage < UV_MEMORY_USAGE and max(width, height) > UV_MEMORY_SIZE:
+        issues.append(Issue(ERROR, f"This texture is over {UV_MEMORY_SIZE} pixels, so all that "
+                                   "unused space will result in extremely high memory usage."))
+    return issues

@@ -201,6 +201,10 @@ def check_texture(name: str, data: bytes) -> TextureReport:
             else:
                 report.issues = rules.check_dimensions(*img.size)
                 report.recommended_size = _recommended_size(img)
+            # A huge texture says so first, flat color or not.
+            huge = rules.huge_texture_issue(*img.size)
+            if huge is not None:
+                report.issues.insert(0, huge)
     except Exception as exc:  # corrupt or unsupported image; report it, keep going
         report.unreadable = True
         report.issues = [rules.Issue(rules.ERROR, f"Could not read image ({exc}).")]
@@ -313,3 +317,14 @@ def check_cabinet(path: str) -> list[TextureReport]:
             reports.append(report)
     reports.sort(key=lambda r: (rules.SEVERITY_ORDER.get(r.severity, 3), r.name.lower()))
     return reports
+
+
+def aoj_cache_files(path: str) -> dict[str, int]:
+    """Age of Joy cache files (`*.aojv1`) in a cabinet, name -> size in bytes.
+
+    The game writes these next to an installed cabinet's textures, so they turn up when
+    a builder opens the cabinet folder straight out of the game's cabinetsdb. They are
+    not the builder's art and must not be shared; the export leaves them out.
+    """
+    with sources.open_source(path) as src:
+        return {n: src.size(n) for n in src.namelist() if sources.is_aoj_cache(n)}
